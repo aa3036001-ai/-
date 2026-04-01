@@ -1,27 +1,9 @@
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║        台股日報 × Resend 自動寄信 — Google Colab 版             ║
-# ║  將每個 # ── CELL N 區塊分別貼入 Colab cell，依序執行           ║
-# ║  Cell 1–4 只需執行一次；Cell 5（防斷線）+ Cell 6（排程）        ║
-# ║  依序執行後即可每天台灣時間 14:00 自動寄出報告                  ║
-# ╚══════════════════════════════════════════════════════════════════╝
+"""
+台股每日 13:30 收盤股價報告 + Resend 自動寄信
+由 GitHub Actions 每天台灣時間 14:00 觸發執行
+"""
 
-
-# ── CELL 1：安裝套件 ──────────────────────────────────────────────
-# !pip install -q yfinance openpyxl pandas pytz matplotlib numpy Pillow resend
-
-
-# ── CELL 2：設定（只需修改這裡）─────────────────────────────────
-RESEND_API_KEY = "re_xxxxxxxxxxxxxx"       # ← 你的 Resend API Key
-EMAIL_FROM     = "reports@yourdomain.com"  # ← Resend 已驗證的寄件地址
-EMAIL_TO       = ["you@example.com"]       # ← 收件人（可多位）
-EMAIL_SUBJECT  = "【台股日報】每日收盤股價報告"
-
-SHEET_ID = "1bg8oZiiDFLMisYBXaDF20aX5MPxjLRNac81I_kWoQGQ"
-GID      = "1668869607"
-
-
-# ── CELL 3：import + 共用樣式 ─────────────────────────────────────
-import io, time, base64, logging
+import io, time, base64, logging, os
 from datetime import datetime, timedelta
 
 import matplotlib
@@ -41,10 +23,18 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-resend.api_key = RESEND_API_KEY
 
-TW_TZ = pytz.timezone("Asia/Taipei")
+# ── 從環境變數讀取設定（由 GitHub Secrets 注入）──────────────────
+resend.api_key = os.environ["RESEND_API_KEY"]
+EMAIL_FROM     = os.environ["EMAIL_FROM"]
+EMAIL_TO       = os.environ["EMAIL_TO"].split(",")   # 多收件人用逗號分隔
+EMAIL_SUBJECT  = "【台股日報】每日收盤股價報告"
 
+SHEET_ID = "1bg8oZiiDFLMisYBXaDF20aX5MPxjLRNac81I_kWoQGQ"
+GID      = "1668869607"
+TW_TZ    = pytz.timezone("Asia/Taipei")
+
+# ── 樣式 ─────────────────────────────────────────────────────────
 def mk_fill(c): return PatternFill("solid", start_color=c)
 def mk_border(c="BFBFBF"):
     s = Side(style="thin", color=c)
@@ -58,11 +48,7 @@ RIGHT=Alignment(horizontal="right", vertical="center")
 def hfont(sz=10): return Font(name="Arial", bold=True, color=C_WHITE, size=sz)
 def nfont(sz=10): return Font(name="Arial", size=sz)
 
-print("✅ 套件與設定載入完成")
-
-
-# ── CELL 4：核心函式 ──────────────────────────────────────────────
-
+# ── 核心函式 ──────────────────────────────────────────────────────
 def fetch(ticker, start, end):
     try:
         raw = yf.download(ticker,
@@ -237,30 +223,25 @@ def write_summary(wb, rows, start, end):
     ws.merge_cells(f"A{nr}:I{nr}")
 
 
-print("✅ 核心函式載入完成")
-
-
-# ── CELL 5：generate_report + send_email 函式定義 ─────────────────
-
 def generate_report():
     now        = datetime.now(TW_TZ)
     end_date   = now.replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = end_date - timedelta(days=91)
 
-    url      = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
-    df_meta  = pd.read_csv(url)
-    tickers  = df_meta["TICKERS"].tolist()
-    names    = dict(zip(df_meta["TICKERS"], df_meta["公司名稱"])) if "公司名稱" in df_meta.columns else {}
+    url     = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
+    df_meta = pd.read_csv(url)
+    tickers = df_meta["TICKERS"].tolist()
+    names   = dict(zip(df_meta["TICKERS"], df_meta["公司名稱"])) if "公司名稱" in df_meta.columns else {}
 
     wb = Workbook(); wb.remove(wb.active)
     summary, ok = [], 0
-    print(f"📥 開始下載 {len(tickers)} 支股票資料...\n")
+    logging.info(f"📥 開始下載 {len(tickers)} 支股票資料...")
 
     for i, ticker in enumerate(tickers, 1):
         market  = "上櫃(OTC)" if ticker.endswith(".TWO") else "上市(TWSE)"
         company = names.get(ticker, "")
         dn      = f"{company}（{ticker}）" if company else ticker
-        print(f"  [{i:02d}/{len(tickers)}] {dn} ({market}) ...", end=" ", flush=True)
+        logging.info(f"  [{i:02d}/{len(tickers)}] {dn} ({market})")
         df = fetch(ticker, start_date, end_date)
         if df is not None and not df.empty:
             write_stock_sheet(wb, ticker, df, names, start_date, end_date)
@@ -269,16 +250,16 @@ def generate_report():
             chg = round((fl-f0)/f0*100, 2) if f0 else None
             summary.append([ticker, market, len(df), f0, fl,
                              float(df["最高價"].max()), float(df["最低價"].min()), chg, "OK"])
-            print(f"✅ {len(df)} 筆"); ok += 1
+            ok += 1
         else:
             summary.append([ticker, market, 0, None, None, None, None, None, "無資料"])
-            print("⚠  跳過")
         time.sleep(0.3)
 
     write_summary(wb, summary, start_date, end_date)
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
-    print(f"\n🎉 報告產生完成！成功 {ok}/{len(tickers)} 支")
+    logging.info(f"🎉 報告產生完成！成功 {ok}/{len(tickers)} 支")
     return buf.read()
+
 
 def send_email(xlsx_bytes):
     now_str = datetime.now(TW_TZ).strftime("%Y-%m-%d")
@@ -296,77 +277,9 @@ def send_email(xlsx_bytes):
         "attachments": [{"filename": fname, "content": base64.b64encode(xlsx_bytes).decode()}],
     }
     result = resend.Emails.send(params)
-    print(f"✅ 郵件已送出！ID：{result['id']}")
-
-print("✅ generate_report / send_email 函式載入完成")
+    logging.info(f"✅ 郵件已送出！ID：{result['id']}")
 
 
-# ── CELL 5：防 Colab 閒置斷線（執行後保持連線）──────────────────
-# 在瀏覽器開發人員工具的 Console 貼入以下 JavaScript，
-# 或直接執行本 cell（會透過 IPython 注入 JS）。
-# 作用：每 60 秒自動點擊 Colab 的連線按鈕，防止 90 分鐘閒置斷線。
-
-from IPython.display import Javascript, display
-
-display(Javascript("""
-function keepAlive() {
-  console.log('[KeepAlive] ' + new Date().toLocaleTimeString());
-  // 嘗試點擊「重新連線」按鈕（若存在）
-  const btn = document.querySelector('colab-connect-button');
-  if (btn) btn.click();
-}
-// 每 55 秒執行一次（略低於 60 秒以確保觸發）
-const _kaTimer = setInterval(keepAlive, 55000);
-console.log('[KeepAlive] 已啟動，每 55 秒觸發一次');
-"""))
-
-print("✅ 防斷線 JS 已注入，請保持瀏覽器視窗開啟（不需在前景，但不能關閉分頁）")
-
-
-# ── CELL 6：每天台灣時間 14:00 自動執行排程 ──────────────────────
-# ⚡ 直接執行此 cell，程式會在背景等待並於每天 14:00（台灣時間）
-#    自動產生報告並寄出，執行後 cell 會持續跑直到你手動中斷。
-#
-# 🔑 關鍵設計：
-#   - 用台灣時間判斷，不依賴 Colab 系統時區（Colab 預設為 UTC）
-#   - 記錄 last_run_date 避免同一天重複觸發
-#   - 每 30 秒檢查一次時間，不佔用大量資源
-
-SEND_HOUR   = 14   # 台灣時間幾點送出（24 小時制）
-SEND_MINUTE = 0    # 幾分送出
-
-last_run_date = None
-
-print(f"⏰ 排程啟動！將於每天台灣時間 {SEND_HOUR:02d}:{SEND_MINUTE:02d} 自動寄出報告")
-print(f"   目前台灣時間：{datetime.now(TW_TZ).strftime('%Y-%m-%d %H:%M:%S')}")
-print("   （手動中斷請按左側 ■ 停止按鈕）\n")
-
-while True:
-    now_tw   = datetime.now(TW_TZ)
-    today    = now_tw.date()
-    is_time  = (now_tw.hour == SEND_HOUR and now_tw.minute == SEND_MINUTE)
-    not_sent = (last_run_date != today)
-
-    if is_time and not_sent:
-        print(f"\n{'='*55}")
-        print(f"🚀 [{now_tw.strftime('%Y-%m-%d %H:%M')}] 開始執行每日報告任務...")
-        print(f"{'='*55}")
-        try:
-            xlsx = generate_report()
-            send_email(xlsx)
-            last_run_date = today
-            print(f"✅ 今日任務完成｜下次執行：明天 {SEND_HOUR:02d}:{SEND_MINUTE:02d}\n")
-        except Exception as e:
-            print(f"❌ 任務失敗：{e}\n")
-            # 失敗不記錄 last_run_date，60 秒後會重試（當分鐘內）
-    else:
-        # 每 10 分鐘印一次心跳，確認程式仍在運行
-        if now_tw.minute % 10 == 0 and now_tw.second < 30:
-            next_run = now_tw.replace(hour=SEND_HOUR, minute=SEND_MINUTE, second=0, microsecond=0)
-            if next_run <= now_tw:
-                next_run += timedelta(days=1)
-            diff = next_run - now_tw
-            h, m = divmod(int(diff.total_seconds()) // 60, 60)
-            print(f"💓 [{now_tw.strftime('%H:%M')}] 等待中... 距下次執行還有 {h}h {m}m")
-
-    time.sleep(30)
+if __name__ == "__main__":
+    xlsx = generate_report()
+    send_email(xlsx)
